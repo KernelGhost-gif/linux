@@ -104,7 +104,7 @@ static int virtcrypto_find_vqs(struct virtio_crypto *vi)
 	struct virtqueue_info *vqs_info;
 	struct virtqueue **vqs;
 	int ret = -ENOMEM;
-	int i, total_vqs;
+	int i, j, total_vqs;
 	struct device *dev = &vi->vdev->dev;
 
 	/*
@@ -138,6 +138,7 @@ static int virtcrypto_find_vqs(struct virtio_crypto *vi)
 	if (ret)
 		goto err_find;
 
+	vi->vqs_initialized = true;
 	vi->ctrl_vq = vqs[total_vqs - 1];
 
 	for (i = 0; i < vi->max_data_queues; i++) {
@@ -159,6 +160,18 @@ static int virtcrypto_find_vqs(struct virtio_crypto *vi)
 	return 0;
 
 err_engine:
+	virtio_reset_device(vi->vdev);
+	virtio_synchronize_cbs(vi->vdev);
+	for (j = 0; j < i; j++) {
+		cancel_work_sync(&vi->data_vq[j].done_work);
+		if (vi->data_vq[j].engine) {
+			crypto_engine_exit(vi->data_vq[j].engine);
+			vi->data_vq[j].engine = NULL;
+		}
+	}
+	vi->vdev->config->del_vqs(vi->vdev);
+	vi->vqs_initialized = false;
+	vi->ctrl_vq = NULL;
 err_find:
 	kfree(vqs_info);
 err_vqs_info:
@@ -180,12 +193,29 @@ static void virtcrypto_clean_affinity(struct virtio_crypto *vi, long hcpu)
 {
 	int i;
 
+	if (!vi->data_vq) {
+		vi->affinity_hint_set = false;
+		return;
+	}
+
 	if (vi->affinity_hint_set) {
 		for (i = 0; i < vi->max_data_queues; i++)
 			virtqueue_set_affinity(vi->data_vq[i].vq, NULL);
 
 		vi->affinity_hint_set = false;
 	}
+}
+
+static void virtcrypto_cancel_done_work(struct virtio_crypto *vcrypto)
+{
+	int i;
+
+	if (!vcrypto->data_vq)
+		return;
+
+	virtio_synchronize_cbs(vcrypto->vdev);
+	for (i = 0; i < vcrypto->max_data_queues; i++)
+		cancel_work_sync(&vcrypto->data_vq[i].done_work);
 }
 
 static void virtcrypto_set_affinity(struct virtio_crypto *vcrypto)
@@ -220,6 +250,10 @@ static void virtcrypto_set_affinity(struct virtio_crypto *vcrypto)
 static void virtcrypto_free_queues(struct virtio_crypto *vi)
 {
 	kfree(vi->data_vq);
+	vi->data_vq = NULL;
+	vi->ctrl_vq = NULL;
+	vi->affinity_hint_set = false;
+	vi->vqs_initialized = false;
 }
 
 static int virtcrypto_init_vqs(struct virtio_crypto *vi)
@@ -316,6 +350,10 @@ static void virtcrypto_clear_crypto_engines(struct virtio_crypto *vcrypto)
 {
 	u32 i;
 
+	if (!vcrypto->data_vq)
+		return;
+
+	virtcrypto_cancel_done_work(vcrypto);
 	for (i = 0; i < vcrypto->max_data_queues; i++)
 		if (vcrypto->data_vq[i].engine)
 			crypto_engine_exit(vcrypto->data_vq[i].engine);
@@ -327,7 +365,11 @@ static void virtcrypto_del_vqs(struct virtio_crypto *vcrypto)
 
 	virtcrypto_clean_affinity(vcrypto, -1);
 
-	vdev->config->del_vqs(vdev);
+	if (vcrypto->vqs_initialized) {
+		virtcrypto_cancel_done_work(vcrypto);
+		vdev->config->del_vqs(vdev);
+		vcrypto->vqs_initialized = false;
+	}
 
 	virtcrypto_free_queues(vcrypto);
 }
@@ -481,6 +523,9 @@ static void virtcrypto_free_unused_reqs(struct virtio_crypto *vcrypto)
 	int i;
 	struct virtqueue *vq;
 
+	if (!vcrypto->data_vq)
+		return;
+
 	for (i = 0; i < vcrypto->max_data_queues; i++) {
 		vq = vcrypto->data_vq[i].vq;
 		while ((vc_req = virtqueue_detach_unused_buf(vq)) != NULL)
@@ -499,9 +544,11 @@ static void virtcrypto_remove(struct virtio_device *vdev)
 	flush_work(&vcrypto->config_work);
 	if (virtcrypto_dev_started(vcrypto))
 		virtcrypto_dev_stop(vcrypto);
-	for (i = 0; i < vcrypto->max_data_queues; i++)
-		cancel_work_sync(&vcrypto->data_vq[i].done_work);
+	if (vcrypto->data_vq)
+		for (i = 0; i < vcrypto->max_data_queues; i++)
+			cancel_work_sync(&vcrypto->data_vq[i].done_work);
 	virtio_reset_device(vdev);
+	virtcrypto_cancel_done_work(vcrypto);
 	virtcrypto_free_unused_reqs(vcrypto);
 	virtcrypto_clear_crypto_engines(vcrypto);
 	virtcrypto_del_vqs(vcrypto);
@@ -523,6 +570,7 @@ static int virtcrypto_freeze(struct virtio_device *vdev)
 
 	flush_work(&vcrypto->config_work);
 	virtio_reset_device(vdev);
+	virtcrypto_cancel_done_work(vcrypto);
 	virtcrypto_free_unused_reqs(vcrypto);
 	if (virtcrypto_dev_started(vcrypto))
 		virtcrypto_dev_stop(vcrypto);

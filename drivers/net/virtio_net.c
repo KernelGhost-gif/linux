@@ -449,6 +449,8 @@ struct virtnet_info {
 	/* CPU hotplug instances for online & dead */
 	struct hlist_node node;
 	struct hlist_node node_dead;
+	bool cpu_notif_registered;
+	bool vqs_initialized;
 
 	struct control_buf *ctrl;
 
@@ -3194,6 +3196,9 @@ static void virtnet_destroy_page_pools(struct virtnet_info *vi)
 {
 	int i;
 
+	if (!vi->rq)
+		return;
+
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		struct receive_queue *rq = &vi->rq[i];
 
@@ -3698,6 +3703,9 @@ static void virtnet_stats(struct net_device *dev,
 	unsigned int start;
 	int i;
 
+	if (unlikely(!vi->rq || !vi->sq))
+		goto out;
+
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		u64 tpackets, tbytes, terrors, rpackets, rbytes, rdrops;
 		struct receive_queue *rq = &vi->rq[i];
@@ -3725,6 +3733,7 @@ static void virtnet_stats(struct net_device *dev,
 		tot->tx_errors  += terrors;
 	}
 
+out:
 	tot->tx_dropped = DEV_STATS_READ(dev, tx_dropped);
 	tot->tx_fifo_errors = DEV_STATS_READ(dev, tx_fifo_errors);
 	tot->rx_length_errors = DEV_STATS_READ(dev, rx_length_errors);
@@ -3841,9 +3850,11 @@ static int virtnet_close(struct net_device *dev)
 	 */
 	cancel_work_sync(&vi->config_work);
 
-	for (i = 0; i < vi->max_queue_pairs; i++) {
-		virtnet_disable_queue_pair(vi, i);
-		virtnet_cancel_dim(vi, &vi->rq[i].dim);
+	if (vi->rq && vi->sq) {
+		for (i = 0; i < vi->max_queue_pairs; i++) {
+			virtnet_disable_queue_pair(vi, i);
+			virtnet_cancel_dim(vi, &vi->rq[i].dim);
+		}
 	}
 
 	netif_carrier_off(dev);
@@ -4073,22 +4084,32 @@ static int virtnet_cpu_notif_add(struct virtnet_info *vi)
 {
 	int ret;
 
+	if (vi->cpu_notif_registered)
+		return -EBUSY;
+
 	ret = cpuhp_state_add_instance_nocalls(virtionet_online, &vi->node);
 	if (ret)
 		return ret;
 	ret = cpuhp_state_add_instance_nocalls(CPUHP_VIRT_NET_DEAD,
 					       &vi->node_dead);
-	if (!ret)
+	if (ret) {
+		cpuhp_state_remove_instance_nocalls(virtionet_online, &vi->node);
 		return ret;
-	cpuhp_state_remove_instance_nocalls(virtionet_online, &vi->node);
-	return ret;
+	}
+
+	vi->cpu_notif_registered = true;
+	return 0;
 }
 
 static void virtnet_cpu_notif_remove(struct virtnet_info *vi)
 {
+	if (!vi->cpu_notif_registered)
+		return;
+
 	cpuhp_state_remove_instance_nocalls(virtionet_online, &vi->node);
 	cpuhp_state_remove_instance_nocalls(CPUHP_VIRT_NET_DEAD,
 					    &vi->node_dead);
+	vi->cpu_notif_registered = false;
 }
 
 static int virtnet_send_ctrl_coal_vq_cmd(struct virtnet_info *vi,
@@ -6348,24 +6369,34 @@ static void virtnet_free_queues(struct virtnet_info *vi)
 	int i;
 
 	for (i = 0; i < vi->max_queue_pairs; i++) {
-		__netif_napi_del(&vi->rq[i].napi);
-		__netif_napi_del(&vi->sq[i].napi);
+		if (vi->rq)
+			__netif_napi_del(&vi->rq[i].napi);
+		if (vi->sq)
+			__netif_napi_del(&vi->sq[i].napi);
 	}
 
 	/* We called __netif_napi_del(),
 	 * we need to respect an RCU grace period before freeing vi->rq
 	 */
-	synchronize_net();
+	if (vi->rq || vi->sq)
+		synchronize_net();
 
 	kfree(vi->rq);
+	vi->rq = NULL;
 	kfree(vi->sq);
+	vi->sq = NULL;
 	kfree(vi->ctrl);
+	vi->ctrl = NULL;
+	vi->cvq = NULL;
 }
 
 static void _free_receive_bufs(struct virtnet_info *vi)
 {
 	struct bpf_prog *old_prog;
 	int i;
+
+	if (!vi->rq)
+		return;
 
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		while (vi->rq[i].pages)
@@ -6380,6 +6411,9 @@ static void _free_receive_bufs(struct virtnet_info *vi)
 
 static void free_receive_bufs(struct virtnet_info *vi)
 {
+	if (!vi->rq)
+		return;
+
 	rtnl_lock();
 	_free_receive_bufs(vi);
 	rtnl_unlock();
@@ -6422,6 +6456,9 @@ static void free_unused_bufs(struct virtnet_info *vi)
 	void *buf;
 	int i;
 
+	if (!vi->rq || !vi->sq)
+		return;
+
 	for (i = 0; i < vi->max_queue_pairs; i++) {
 		struct virtqueue *vq = vi->sq[i].vq;
 		while ((buf = virtqueue_detach_unused_buf(vq)) != NULL)
@@ -6444,7 +6481,10 @@ static void virtnet_del_vqs(struct virtnet_info *vi)
 
 	virtnet_clean_affinity(vi);
 
-	vdev->config->del_vqs(vdev);
+	if (vi->vqs_initialized) {
+		vdev->config->del_vqs(vdev);
+		vi->vqs_initialized = false;
+	}
 
 	virtnet_free_queues(vi);
 }
@@ -6528,6 +6568,7 @@ static int virtnet_find_vqs(struct virtnet_info *vi)
 		vi->rq[i].min_buf_len = mergeable_min_buf_len(vi, vi->rq[i].vq);
 		vi->sq[i].vq = vqs[txq2vq(i)];
 	}
+	vi->vqs_initialized = true;
 	/* run here: ret == 0. */
 
 err_find:
@@ -6580,8 +6621,10 @@ static int virtnet_alloc_queues(struct virtnet_info *vi)
 
 err_rq:
 	kfree(vi->sq);
+	vi->sq = NULL;
 err_sq:
 	kfree(vi->ctrl);
+	vi->ctrl = NULL;
 err_ctrl:
 	return -ENOMEM;
 }

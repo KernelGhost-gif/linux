@@ -357,9 +357,11 @@ static void virtinput_remove(struct virtio_device *vdev)
 	/* Callbacks use vi->idev. */
 	virtio_reset_device(vdev);
 	input_unregister_device(vi->idev);
-	while ((buf = virtqueue_detach_unused_buf(vi->sts)) != NULL)
-		kfree(buf);
-	vdev->config->del_vqs(vdev);
+	if (vi->sts)
+		while ((buf = virtqueue_detach_unused_buf(vi->sts)) != NULL)
+			kfree(buf);
+	if (vi->evt || vi->sts)
+		vdev->config->del_vqs(vdev);
 	kfree(vi);
 }
 
@@ -378,6 +380,8 @@ static int virtinput_freeze(struct virtio_device *vdev)
 	while ((buf = virtqueue_detach_unused_buf(vi->sts)) != NULL)
 		kfree(buf);
 	vdev->config->del_vqs(vdev);
+	vi->evt = NULL;
+	vi->sts = NULL;
 	return 0;
 }
 

@@ -212,15 +212,19 @@ void virtio_gpu_reclaim_vbufs(struct virtio_gpu_device *vgdev)
 {
 	struct virtio_gpu_vbuffer *vbuf;
 
-	while ((vbuf = virtqueue_detach_unused_buf(vgdev->ctrlq.vq))) {
-		if (vbuf->objs)
-			virtio_gpu_array_put_free(vbuf->objs);
-		if (vbuf->resp_cb_data)
-			virtio_gpu_cleanup_object(vbuf->resp_cb_data);
-		free_vbuf(vgdev, vbuf);
+	if (vgdev->ctrlq.vq) {
+		while ((vbuf = virtqueue_detach_unused_buf(vgdev->ctrlq.vq))) {
+			if (vbuf->objs)
+				virtio_gpu_array_put_free(vbuf->objs);
+			if (vbuf->resp_cb_data)
+				virtio_gpu_cleanup_object(vbuf->resp_cb_data);
+			free_vbuf(vgdev, vbuf);
+		}
 	}
-	while ((vbuf = virtqueue_detach_unused_buf(vgdev->cursorq.vq)))
-		free_vbuf(vgdev, vbuf);
+	if (vgdev->cursorq.vq) {
+		while ((vbuf = virtqueue_detach_unused_buf(vgdev->cursorq.vq)))
+			free_vbuf(vgdev, vbuf);
+	}
 }
 
 static void reclaim_vbufs(struct virtqueue *vq, struct list_head *reclaim_list)

@@ -227,6 +227,8 @@ static int virtgpu_freeze(struct virtio_device *vdev)
 
 	virtio_reset_device(vdev);
 	vdev->config->del_vqs(vdev);
+	vgdev->ctrlq.vq = NULL;
+	vgdev->cursorq.vq = NULL;
 
 	return 0;
 

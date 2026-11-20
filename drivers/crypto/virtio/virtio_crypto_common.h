@@ -80,6 +80,7 @@ struct virtio_crypto {
 
 	/* Does the affinity hint is set for virtqueues? */
 	bool affinity_hint_set;
+	bool vqs_initialized;
 };
 
 struct virtio_crypto_sym_session_info {

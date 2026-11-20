@@ -61,6 +61,7 @@ struct virtio_kctl {
  */
 struct virtio_snd {
 	struct virtio_device *vdev;
+	bool vqs_initialized;
 	struct virtio_snd_queue queues[VIRTIO_SND_VQ_MAX];
 	struct snd_card *card;
 	struct list_head ctl_msgs;

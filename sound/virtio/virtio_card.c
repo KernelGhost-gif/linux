@@ -129,6 +129,7 @@ static int virtsnd_find_vqs(struct virtio_snd *snd)
 		return rc;
 	}
 
+	snd->vqs_initialized = true;
 	for (i = 0; i < VIRTIO_SND_VQ_MAX; ++i)
 		snd->queues[i].vqueue = vqs[i];
 
@@ -354,8 +355,13 @@ static void virtsnd_remove(struct virtio_device *vdev)
 	if (snd->card)
 		snd_card_free(snd->card);
 
-	virtio_reset_device(vdev);
-	vdev->config->del_vqs(vdev);
+	if (snd->vqs_initialized) {
+		virtio_reset_device(vdev);
+		vdev->config->del_vqs(vdev);
+		snd->vqs_initialized = false;
+	}
+	for (i = 0; i < VIRTIO_SND_VQ_MAX; ++i)
+		snd->queues[i].vqueue = NULL;
 
 	for (i = 0; snd->substreams && i < snd->nsubstreams; ++i) {
 		struct virtio_pcm_substream *vss = &snd->substreams[i];
@@ -383,8 +389,13 @@ static int virtsnd_freeze(struct virtio_device *vdev)
 	virtsnd_disable_event_vq(snd);
 	virtsnd_ctl_msg_cancel_all(snd);
 
-	virtio_reset_device(vdev);
-	vdev->config->del_vqs(vdev);
+	if (snd->vqs_initialized) {
+		virtio_reset_device(vdev);
+		vdev->config->del_vqs(vdev);
+		snd->vqs_initialized = false;
+	}
+	for (i = 0; i < VIRTIO_SND_VQ_MAX; ++i)
+		snd->queues[i].vqueue = NULL;
 
 	for (i = 0; i < snd->nsubstreams; ++i)
 		cancel_work_sync(&snd->substreams[i].elapsed_period);

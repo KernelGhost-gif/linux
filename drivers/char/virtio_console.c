@@ -163,6 +163,7 @@ struct ports_device {
 	 * with virtqueue teardown (e.g. hvc put_chars with no_console_suspend).
 	 */
 	bool pm_freezing;
+	bool vqs_initialized;
 };
 
 struct port_stats {
@@ -478,6 +479,9 @@ static struct port_buffer *get_inbuf(struct port *port)
 	if (port->inbuf)
 		return port->inbuf;
 
+	if (!port->in_vq)
+		return NULL;
+
 	buf = virtqueue_get_buf(port->in_vq, &len);
 	if (buf) {
 		buf->len = min_t(size_t, len, buf->size);
@@ -515,6 +519,12 @@ static void discard_port_data(struct port *port)
 
 	if (!port->portdev) {
 		/* Device has been unplugged.  vqs are already gone. */
+		return;
+	}
+	if (!port->in_vq) {
+		if (port->inbuf)
+			free_buf(port->inbuf, false);
+		port->inbuf = NULL;
 		return;
 	}
 	buf = get_inbuf(port);
@@ -559,9 +569,12 @@ static ssize_t __send_control_msg(struct ports_device *portdev, u32 port_id,
 	if (!use_multiport(portdev))
 		return 0;
 
-	vq = portdev->c_ovq;
-
 	spin_lock(&portdev->c_ovq_lock);
+	vq = portdev->c_ovq;
+	if (!vq) {
+		spin_unlock(&portdev->c_ovq_lock);
+		return 0;
+	}
 
 	portdev->cpkt.id = cpu_to_virtio32(portdev->vdev, port_id);
 	portdev->cpkt.event = cpu_to_virtio16(portdev->vdev, event);
@@ -596,8 +609,8 @@ static void reclaim_consumed_buffers(struct port *port)
 	struct port_buffer *buf;
 	unsigned int len;
 
-	if (!port->portdev) {
-		/* Device has been unplugged.  vqs are already gone. */
+	if (!port->portdev || !port->out_vq) {
+		/* Device has been unplugged or its queues are not initialized. */
 		return;
 	}
 	while ((buf = virtqueue_get_buf(port->out_vq, &len))) {
@@ -725,8 +738,12 @@ static ssize_t fill_readbuf(struct port *port, u8 __user *out_buf,
 		spin_lock_irqsave(&port->inbuf_lock, flags);
 		port->inbuf = NULL;
 
-		if (add_inbuf(port->in_vq, buf) < 0)
-			dev_warn(port->dev, "failed add_buf\n");
+		if (port->in_vq) {
+			if (add_inbuf(port->in_vq, buf) < 0)
+				dev_warn(port->dev, "failed add_buf\n");
+		} else {
+			free_buf(buf, false);
+		}
 
 		spin_unlock_irqrestore(&port->inbuf_lock, flags);
 	}
@@ -927,6 +944,8 @@ static ssize_t port_fops_splice_write(struct pipe_inode_info *pipe,
 	struct sg_list sgl;
 	ssize_t ret;
 	struct port_buffer *buf;
+	struct virtqueue *out_vq;
+	unsigned long irqflags;
 	struct splice_desc sd = {
 		.total_len = len,
 		.flags = flags,
@@ -941,8 +960,13 @@ static ssize_t port_fops_splice_write(struct pipe_inode_info *pipe,
 	 * regular pages to dma pages. And alloc_buf and free_buf must
 	 * support allocating and freeing such a list of dma-buffers.
 	 */
-	if (is_rproc_serial(port->out_vq->vdev))
+	spin_lock_irqsave(&port->outvq_lock, irqflags);
+	out_vq = port->out_vq;
+	if (out_vq && is_rproc_serial(out_vq->vdev)) {
+		spin_unlock_irqrestore(&port->outvq_lock, irqflags);
 		return -EINVAL;
+	}
+	spin_unlock_irqrestore(&port->outvq_lock, irqflags);
 
 	pipe_lock(pipe);
 	ret = 0;
@@ -1192,8 +1216,7 @@ static ssize_t get_chars(u32 vtermno, u8 *buf, size_t count)
 	if (!port)
 		return -EPIPE;
 
-	/* If we don't have an input queue yet, we can't get input. */
-	BUG_ON(!port->in_vq);
+	/* A failed restore can leave the console without an input queue. */
 
 	return fill_readbuf(port, (__force u8 __user *)buf, count, false);
 }
@@ -1549,6 +1572,10 @@ static void unplug_port(struct port *port)
 
 	remove_port_data(port);
 
+	spin_lock_irq(&port->inbuf_lock);
+	port->in_vq = NULL;
+	spin_unlock_irq(&port->inbuf_lock);
+
 	/*
 	 * Null out portdev under outvq_lock so that __send_to_port()
 	 * cannot race: it checks port->portdev inside the same lock
@@ -1558,6 +1585,7 @@ static void unplug_port(struct port *port)
 	 * message.
 	 */
 	spin_lock_irq(&port->outvq_lock);
+	port->out_vq = NULL;
 	port->portdev = NULL;
 	spin_unlock_irq(&port->outvq_lock);
 
@@ -1932,6 +1960,7 @@ static int init_vqs(struct ports_device *portdev)
 			portdev->out_vqs[i] = vqs[j + 1];
 		}
 	}
+	portdev->vqs_initialized = true;
 	kfree(vqs_info);
 	kfree(vqs);
 
@@ -1939,7 +1968,9 @@ static int init_vqs(struct ports_device *portdev)
 
 free:
 	kfree(portdev->out_vqs);
+	portdev->out_vqs = NULL;
 	kfree(portdev->in_vqs);
+	portdev->in_vqs = NULL;
 	kfree(vqs_info);
 	kfree(vqs);
 
@@ -1953,6 +1984,7 @@ static const struct file_operations portdev_fops = {
 static void remove_vqs(struct ports_device *portdev)
 {
 	struct virtqueue *vq;
+	struct port *port;
 	bool multiport = use_multiport(portdev);
 
 	virtio_device_for_each_vq(portdev->vdev, vq) {
@@ -1977,9 +2009,30 @@ static void remove_vqs(struct ports_device *portdev)
 		}
 		cond_resched();
 	}
-	portdev->vdev->config->del_vqs(portdev->vdev);
+	list_for_each_entry(port, &portdev->ports, list) {
+		spin_lock_irq(&port->inbuf_lock);
+		port->in_vq = NULL;
+		spin_unlock_irq(&port->inbuf_lock);
+		spin_lock_irq(&port->outvq_lock);
+		port->out_vq = NULL;
+		spin_unlock_irq(&port->outvq_lock);
+	}
+	if (multiport) {
+		spin_lock_irq(&portdev->c_ivq_lock);
+		portdev->c_ivq = NULL;
+		spin_unlock_irq(&portdev->c_ivq_lock);
+		spin_lock_irq(&portdev->c_ovq_lock);
+		portdev->c_ovq = NULL;
+		spin_unlock_irq(&portdev->c_ovq_lock);
+	}
+	if (portdev->vqs_initialized) {
+		portdev->vdev->config->del_vqs(portdev->vdev);
+		portdev->vqs_initialized = false;
+	}
 	kfree(portdev->in_vqs);
+	portdev->in_vqs = NULL;
 	kfree(portdev->out_vqs);
+	portdev->out_vqs = NULL;
 }
 
 static void virtcons_remove(struct virtio_device *vdev)
