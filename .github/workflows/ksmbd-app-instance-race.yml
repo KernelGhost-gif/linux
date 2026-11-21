@@ -1,0 +1,144 @@
+name: ksmbd APP_INSTANCE_ID race lab
+
+on:
+  push:
+    branches:
+      - ksmbd-app-instance-race-lab
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ksmbd-app-instance-race-lab
+  cancel-in-progress: true
+
+jobs:
+  race:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - name: Check out test branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install kernel, VM, and ksmbd test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio dwarves flex \
+            git iproute2 libelf-dev libncurses-dev libssl-dev \
+            ksmbd-tools qemu-system-x86 qemu-utils python3-dev python3-pip
+
+      - name: Install virtme-ng and SMB protocol client
+        run: |
+          sudo python3 -m pip install --break-system-packages virtme-ng smbprotocol
+          vng --version
+          ksmbd.mountd --help | head -20
+
+      - name: Instrument the vulnerable reader for a deterministic race window
+        run: |
+          python3 .github/scripts/prepare_ksmbd_race.py instrument
+          git diff --check
+
+      - name: Build vulnerable KASAN + lockdep kernel
+        run: |
+          sudo timeout 35m vng --build --jobs 2 \
+            --configitem CONFIG_SMP=y \
+            --configitem CONFIG_SMB_SERVER=y \
+            --configitem CONFIG_KASAN=y \
+            --configitem CONFIG_KASAN_GENERIC=y \
+            --configitem CONFIG_PROVE_LOCKING=y \
+            --configitem CONFIG_DEBUG_LOCK_ALLOC=y \
+            --configitem CONFIG_KALLSYMS_ALL=y \
+            --configitem CONFIG_NLS=y \
+            --configitem CONFIG_NLS_UTF8=y
+          grep -E '^(CONFIG_SMB_SERVER|CONFIG_KASAN|CONFIG_KASAN_GENERIC|CONFIG_PROVE_LOCKING)=' .config
+
+      - name: Exercise the unpatched session teardown path inside QEMU
+        id: baseline
+        continue-on-error: true
+        run: |
+          set +e
+          sudo timeout --signal=KILL 80s vng --cpus 4 --memory 6G --user root \
+            --append panic_on_oops=1 --append panic=1 \
+            --exec "bash -lc 'cd \"$GITHUB_WORKSPACE\" && python3 .github/scripts/ksmbd_app_instance_race.py'" \
+            2>&1 | tee "$RUNNER_TEMP/ksmbd-vulnerable.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "vulnerable_guest_exit_code=$rc" | tee -a "$RUNNER_TEMP/ksmbd-vulnerable.log"
+          if grep -Eqi 'KSMBD_APP_INSTANCE_RACE_WINDOW' "$RUNNER_TEMP/ksmbd-vulnerable.log"; then
+            echo "reader_window_reached=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reader_window_reached=false" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -Eqi 'BUG: KASAN|KASAN:|Unable to handle kernel NULL pointer|NULL pointer dereference|Oops:|Kernel panic' "$RUNNER_TEMP/ksmbd-vulnerable.log"; then
+            echo "crash_reproduced=true" >> "$GITHUB_OUTPUT"
+            echo "### Vulnerable baseline: kernel fault observed" >> "$GITHUB_STEP_SUMMARY"
+            grep -Ei 'BUG: KASAN|KASAN:|Unable to handle kernel NULL pointer|NULL pointer dereference|Oops:|Kernel panic' "$RUNNER_TEMP/ksmbd-vulnerable.log" | tail -20 >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "crash_reproduced=false" >> "$GITHUB_OUTPUT"
+            echo "### Vulnerable baseline: no kernel fault detected" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Apply candidate lifetime fix to all live fp->conn writers
+        run: |
+          python3 .github/scripts/prepare_ksmbd_race.py fix
+          git diff --check
+          git diff -- fs/smb/server/vfs_cache.c > "$RUNNER_TEMP/ksmbd-candidate-fix.diff"
+
+      - name: Rebuild fixed kernel
+        run: |
+          sudo timeout 20m vng --build --jobs 2 \
+            --configitem CONFIG_SMP=y \
+            --configitem CONFIG_SMB_SERVER=y \
+            --configitem CONFIG_KASAN=y \
+            --configitem CONFIG_KASAN_GENERIC=y \
+            --configitem CONFIG_PROVE_LOCKING=y \
+            --configitem CONFIG_DEBUG_LOCK_ALLOC=y \
+            --configitem CONFIG_KALLSYMS_ALL=y \
+            --configitem CONFIG_NLS=y \
+            --configitem CONFIG_NLS_UTF8=y
+
+      - name: Repeat the same race against the fixed kernel
+        id: fixed
+        run: |
+          set +e
+          sudo timeout --signal=KILL 80s vng --cpus 4 --memory 6G --user root \
+            --append panic_on_oops=1 --append panic=1 \
+            --exec "bash -lc 'cd \"$GITHUB_WORKSPACE\" && python3 .github/scripts/ksmbd_app_instance_race.py'" \
+            2>&1 | tee "$RUNNER_TEMP/ksmbd-fixed.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "fixed_guest_exit_code=$rc" | tee -a "$RUNNER_TEMP/ksmbd-fixed.log"
+          if grep -Eqi 'BUG: KASAN|KASAN:|Unable to handle kernel NULL pointer|NULL pointer dereference|Oops:|Kernel panic' "$RUNNER_TEMP/ksmbd-fixed.log"; then
+            echo "### Fixed build: unexpected kernel fault" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if ! grep -Eqi 'KSMBD_APP_INSTANCE_RACE_WINDOW' "$RUNNER_TEMP/ksmbd-fixed.log"; then
+            echo "Fixed test did not reach the instrumented reader window" >&2
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "Fixed guest exited abnormally (status $rc)" >&2
+            exit 1
+          fi
+          echo "### Fixed build: reader window reached; no kernel fault detected" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload serial logs and candidate diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksmbd-app-instance-race-results
+          path: |
+            ${{ runner.temp }}/ksmbd-vulnerable.log
+            ${{ runner.temp }}/ksmbd-fixed.log
+            ${{ runner.temp }}/ksmbd-candidate-fix.diff
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce expected vulnerable-baseline result
+        if: steps.baseline.outputs.reader_window_reached == 'true' && steps.baseline.outputs.crash_reproduced != 'true'
+        run: |
+          echo "Race window was reached but the vulnerable kernel did not fault. This run is inconclusive." >> "$GITHUB_STEP_SUMMARY"
