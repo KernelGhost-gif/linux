@@ -68,7 +68,7 @@ jobs:
           rc=${PIPESTATUS[0]}
           set -e
           echo "vulnerable_guest_exit_code=$rc" | tee -a "$RUNNER_TEMP/ksmbd-vulnerable.log"
-          if grep -Eqi 'KSMBD_APP_INSTANCE_RACE_WINDOW' "$RUNNER_TEMP/ksmbd-vulnerable.log"; then
+          if grep -Eqi 'READER_IN_WINDOW' "$RUNNER_TEMP/ksmbd-vulnerable.log"; then
             echo "reader_window_reached=true" >> "$GITHUB_OUTPUT"
           else
             echo "reader_window_reached=false" >> "$GITHUB_OUTPUT"
@@ -79,7 +79,8 @@ jobs:
             grep -Ei 'BUG: KASAN|KASAN:|Unable to handle kernel NULL pointer|NULL pointer dereference|Oops:|Kernel panic' "$RUNNER_TEMP/ksmbd-vulnerable.log" | tail -20 >> "$GITHUB_STEP_SUMMARY"
           else
             echo "crash_reproduced=false" >> "$GITHUB_OUTPUT"
-            echo "### Vulnerable baseline: no kernel fault detected" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Vulnerable baseline: no kernel fault detected; race was not reproduced" >> "$GITHUB_STEP_SUMMARY"
+            echo "This is inconclusive for the proposed UAF. A clean baseline run is not proof of absence." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Apply candidate lifetime fix to all live fp->conn writers
@@ -116,7 +117,7 @@ jobs:
             echo "### Fixed build: unexpected kernel fault" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          if ! grep -Eqi 'KSMBD_APP_INSTANCE_RACE_WINDOW' "$RUNNER_TEMP/ksmbd-fixed.log"; then
+          if ! grep -Eqi 'READER_IN_WINDOW' "$RUNNER_TEMP/ksmbd-fixed.log"; then
             echo "Fixed test did not reach the instrumented reader window" >&2
             exit 1
           fi
@@ -138,7 +139,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Enforce expected vulnerable-baseline result
+      - name: Record vulnerable-baseline reproduction status
         if: steps.baseline.outputs.reader_window_reached == 'true' && steps.baseline.outputs.crash_reproduced != 'true'
         run: |
           echo "Race window was reached but the vulnerable kernel did not fault. This run is inconclusive." >> "$GITHUB_STEP_SUMMARY"
