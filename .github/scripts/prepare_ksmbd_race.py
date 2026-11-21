@@ -35,7 +35,7 @@ def instrument(text):
     spin_lock(&fp->f_lock);
     if (READ_ONCE(fp->f_state) == FP_INITED && fp->conn && fp->share_conf) {
         pr_info("KSMBD_APP_INSTANCE_RACE_WINDOW\\n");
-        udelay(250000);
+        mdelay(250);
         matches = !strcmp(fp->share_conf->name, work->tcon->share_conf->name) &&
                   memcmp(fp->conn->ClientGUID, work->conn->ClientGUID,
                          SMB2_CLIENT_GUID_SIZE);
@@ -60,7 +60,7 @@ def fix(text):
     conn = fp->conn;
     if (READ_ONCE(fp->f_state) == FP_INITED && conn && fp->share_conf) {
         pr_info("KSMBD_APP_INSTANCE_RACE_WINDOW\\n");
-        udelay(250000);
+        mdelay(250);
         matches = !strcmp(fp->share_conf->name, work->tcon->share_conf->name) &&
                   memcmp(conn->ClientGUID, work->conn->ClientGUID,
                          SMB2_CLIENT_GUID_SIZE);
