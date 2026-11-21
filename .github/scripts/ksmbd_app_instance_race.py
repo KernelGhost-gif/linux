@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Local-only ksmbd APP_INSTANCE_ID teardown race reproducer for a disposable VM."""
+"""Local-only ksmbd APP_INSTANCE_ID teardown race test for a disposable VM."""
+import os
 import socket
 import subprocess
 import threading
@@ -29,9 +30,64 @@ SERVER = "127.0.0.1"
 PORT = 445
 USERNAME = "ksmbdtest"
 PASSWORD = "KsmBd-Lab-Only-42!"
-SHARE = rf"\\{SERVER}\\race"
+SHARE = rf"\\{SERVER}\race"
 FILENAME = "app-instance-race.dat"
 MARKER = "KSMBD_APP_INSTANCE_RACE_WINDOW"
+CONF = "/etc/ksmbd/ksmbd.conf"
+PWDDB = "/etc/ksmbd/ksmbdpwd.db"
+SHARE_PATH = "/tmp/ksmbd-race-share"
+
+
+def start_server():
+    os.makedirs("/etc/ksmbd", exist_ok=True)
+    os.makedirs(SHARE_PATH, exist_ok=True)
+    os.chmod(SHARE_PATH, 0o777)
+    with open(CONF, "w", encoding="utf-8") as f:
+        f.write(
+            "[global]\n"
+            "server string = ksmbd isolated race lab\n"
+            "workgroup = WORKGROUP\n"
+            "\n"
+            "[race]\n"
+            f"path = {SHARE_PATH}\n"
+            "read only = no\n"
+            "guest ok = no\n"
+            f"valid users = {USERNAME}\n"
+        )
+    subprocess.run(
+        ["ksmbd.adduser", "-a", "-p", PASSWORD, "-C", CONF, "-P", PWDDB, USERNAME],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    log = open("/tmp/ksmbd-mountd.log", "w", encoding="utf-8")
+    proc = subprocess.Popen(
+        ["ksmbd.mountd", "-n", "-C", CONF, "-P", PWDDB],
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            log.flush()
+            raise RuntimeError(
+                "ksmbd.mountd exited early: "
+                + open("/tmp/ksmbd-mountd.log", encoding="utf-8").read()
+            )
+        try:
+            with socket.create_connection((SERVER, PORT), timeout=0.2):
+                time.sleep(0.5)
+                print("KSMBD_SERVER_READY", flush=True)
+                return proc, log
+        except OSError:
+            time.sleep(0.1)
+    log.flush()
+    raise RuntimeError(
+        "ksmbd did not listen on 127.0.0.1:445: "
+        + open("/tmp/ksmbd-mountd.log", encoding="utf-8").read()
+    )
 
 
 def connect(client_guid):
@@ -91,8 +147,11 @@ def create_durable(tree, app_id):
 def marker_seen():
     try:
         result = subprocess.run(
-            ["dmesg"], check=False, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True,
+            ["dmesg"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
         )
         return MARKER in result.stdout
     except Exception:
@@ -100,9 +159,10 @@ def marker_seen():
 
 
 def main():
-    # The whole SMB server and both clients are inside the same QEMU guest.
-    # No network connection leaves this disposable VM.
+    # Server and both authenticated clients are confined to this QEMU guest.
+    server, server_log = start_server()
     app_id = uuid.uuid4()
+
     conn_b, tree_b = connect(uuid.uuid4())
     handle_b = create_durable(tree_b, app_id)
     print("HOLDER_OPENED durable-v2 + batch oplock + APP_INSTANCE_ID", flush=True)
@@ -137,8 +197,8 @@ def main():
         )
 
     print("READER_IN_WINDOW; dropping holder TCP connection now", flush=True)
-    # Abrupt TCP close is what drives session_fd_check() while the other
-    # connection is inside ksmbd_app_instance_id_matches().
+    # Abrupt TCP close drives session_fd_check() while the other connection
+    # is in ksmbd_app_instance_id_matches().
     conn_b.transport.close()
 
     thread.join(timeout=8)
@@ -147,8 +207,8 @@ def main():
     else:
         print("CONTENDER_FINISHED", flush=True)
 
-    # Keep resources reachable until the test attempt is over.
-    _ = (handle_b, conn_a, tree_a, tree_b, request_error)
+    # Keep the server and connection objects alive until the attempt ends.
+    _ = (handle_b, conn_a, tree_a, tree_b, request_error, server, server_log)
     print("RACE_ATTEMPT_FINISHED", flush=True)
 
 
